@@ -38,6 +38,9 @@ EXCLUDED_DIRS = {
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    ".tox",
+    ".nox",
+    "_worktrees",
     "work",
 }
 
@@ -85,6 +88,7 @@ class CheckResult:
     output: str = ""
     reason: str = ""
     files: list[str] = field(default_factory=list)
+    install_command: str = ""
 
 
 @dataclass
@@ -152,6 +156,7 @@ def run_command(
             command=command_text(command),
             reason=f"未找到工具：{executable}",
             files=list(files),
+            install_command=install_command_for(root, executable),
         )
 
     try:
@@ -224,6 +229,85 @@ def run_python_parser(name: str, path: Path, root: Path) -> CheckResult:
 
 def missing_tool_reason(tool: str) -> str:
     return f"未找到 {tool}；{INSTALL_HINTS.get(tool, '请安装项目要求的检查工具')}"
+
+
+def project_python(root: Path) -> str:
+    for candidate in (
+        root / ".venv" / "Scripts" / "python.exe",
+        root / ".venv" / "bin" / "python",
+        root / "venv" / "Scripts" / "python.exe",
+        root / "venv" / "bin" / "python",
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    return "python"
+
+
+def install_command_for(root: Path, tool: str) -> str:
+    """生成待用户确认的安装命令；这里只生成，不执行。"""
+    name = Path(tool).name.lower()
+    name = re.sub(r"\.(exe|cmd|bat)$", "", name)
+    python = project_python(root)
+    if name in {"ruff", "pytest", "pre-commit", "yamllint"}:
+        return f"{command_text([python, '-m', 'pip', 'install', name])}"
+    if name == "psscriptanalyzer":
+        return "Install-Module PSScriptAnalyzer -Scope CurrentUser"
+    if name in {"markdownlint", "markdownlint-cli2"}:
+        return "npm install --save-dev markdownlint-cli"
+    if name in {"npm", "npx"}:
+        return "请安装 Node.js（包含 npm/npx）"
+    if name == "shellcheck":
+        return "请安装 ShellCheck"
+    if name == "dotnet":
+        return "请安装对应版本的 .NET SDK"
+    if name in {"powershell", "pwsh"}:
+        return "请安装 PowerShell"
+    if name in {"make", "gmake"}:
+        return "请安装 GNU Make 或 gmake"
+    return INSTALL_HINTS.get(tool, "请安装项目要求的检查工具")
+
+
+def missing_tool_result(root: Path, name: str, tool: str, files: Sequence[str] = ()) -> CheckResult:
+    return CheckResult(
+        name=name,
+        status="SKIP",
+        reason=missing_tool_reason(tool),
+        files=list(files),
+        install_command=install_command_for(root, tool),
+    )
+
+
+def run_batched_command(
+    name: str,
+    base_command: Sequence[str],
+    files: Sequence[str],
+    root: Path,
+    max_command_chars: int = 6000,
+) -> list[CheckResult]:
+    """按命令长度拆分文件，避免 Windows CreateProcess 命令过长。"""
+    if not files:
+        return [run_command(name, base_command, root)]
+    batches: list[list[str]] = []
+    current: list[str] = []
+    for file_path in files:
+        candidate = [*base_command, *current, file_path]
+        if current and len(command_text(candidate)) > max_command_chars:
+            batches.append(current)
+            current = [file_path]
+        else:
+            current.append(file_path)
+    if current:
+        batches.append(current)
+    total = len(batches)
+    return [
+        run_command(
+            f"{name} [{index}/{total}]" if total > 1 else name,
+            [*base_command, *batch],
+            root,
+            batch,
+        )
+        for index, batch in enumerate(batches, start=1)
+    ]
 
 
 def load_project_config(root: Path) -> ProjectConfig:
@@ -404,7 +488,7 @@ def add_required_tool_checks(root: Path, config: ProjectConfig) -> list[CheckRes
         if which_in_project(root, [tool]):
             results.append(CheckResult(f"必需工具：{tool}", "PASS"))
         else:
-            results.append(CheckResult(f"必需工具：{tool}", "SKIP", reason=missing_tool_reason(tool)))
+            results.append(missing_tool_result(root, f"必需工具：{tool}", tool))
     return results
 
 
@@ -413,6 +497,7 @@ def add_python_checks(
     selected: Sequence[str],
     all_paths: Sequence[Path],
     run_tests: bool = True,
+    all_mode: bool = False,
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
     py_files = [path for path in selected if path.lower().endswith(".py")]
@@ -423,17 +508,14 @@ def add_python_checks(
 
     ruff = which_in_project(root, ["ruff"])
     if py_files and ruff:
-        results.append(run_command("Ruff 代码检查", [ruff, "check", *py_files], root, py_files))
-        results.append(run_command("Ruff 格式检查", [ruff, "format", "--check", *py_files], root, py_files))
+        if all_mode:
+            results.append(run_command("Ruff 代码检查", [ruff, "check", "."], root))
+            results.append(run_command("Ruff 格式检查", [ruff, "format", "--check", "."], root))
+        else:
+            results.extend(run_batched_command("Ruff 代码检查", [ruff, "check"], py_files, root))
+            results.extend(run_batched_command("Ruff 格式检查", [ruff, "format", "--check"], py_files, root))
     elif py_files:
-        results.append(
-            CheckResult(
-                name="Ruff",
-                status="SKIP",
-                reason=missing_tool_reason("ruff"),
-                files=py_files,
-            )
-        )
+        results.append(missing_tool_result(root, "Ruff", "ruff", py_files))
 
     has_tests = any(path.name.startswith("test_") or path.name.endswith("_test.py") for path in all_paths)
     if run_tests and has_tests and (py_files or config_changed):
@@ -441,13 +523,7 @@ def add_python_checks(
         if pytest:
             results.append(run_command("pytest 测试", [pytest, "-q"], root))
         else:
-            results.append(
-                CheckResult(
-                    name="pytest",
-                    status="SKIP",
-                    reason=missing_tool_reason("pytest"),
-                )
-            )
+            results.append(missing_tool_result(root, "pytest", "pytest"))
     return results
 
 
@@ -468,23 +544,30 @@ def add_node_checks(root: Path, selected: Sequence[str], run_tests: bool = True)
     if npm and ("lint" in scripts and (js_files or package_changed)):
         results.append(run_command("npm lint", [npm, "run", "lint"], root, js_files))
     elif "lint" in scripts and (js_files or package_changed):
-        results.append(CheckResult("npm lint", "SKIP", reason=missing_tool_reason("npm")))
+        results.append(missing_tool_result(root, "npm lint", "npm"))
 
     if run_tests and npm and "test" in scripts and (js_files or package_changed):
         results.append(run_command("npm test", [npm, "run", "test", "--if-present"], root, js_files))
     elif run_tests and "test" in scripts and (js_files or package_changed):
-        results.append(CheckResult("npm test", "SKIP", reason=missing_tool_reason("npm")))
+        results.append(missing_tool_result(root, "npm test", "npm"))
 
     npx = which_in_project(root, ["npx.cmd", "npx"])
     if npx and js_files and "lint" not in scripts and package_has_dependency(package, "eslint"):
-        results.append(run_command("ESLint", [npx, "--no-install", "eslint", *js_files], root, js_files))
+        results.extend(run_batched_command("ESLint", [npx, "--no-install", "eslint"], js_files, root))
     elif js_files and "lint" not in scripts and package_has_dependency(package, "eslint"):
-        results.append(CheckResult("ESLint", "SKIP", reason=missing_tool_reason("npx")))
+        results.append(missing_tool_result(root, "ESLint", "npx", js_files))
 
     if npx and js_files and package_has_dependency(package, "prettier"):
-        results.append(run_command("Prettier 格式检查", [npx, "--no-install", "prettier", "--check", *js_files], root, js_files))
+        results.extend(
+            run_batched_command(
+                "Prettier 格式检查",
+                [npx, "--no-install", "prettier", "--check"],
+                js_files,
+                root,
+            )
+        )
     elif js_files and package_has_dependency(package, "prettier"):
-        results.append(CheckResult("Prettier", "SKIP", reason=missing_tool_reason("npx")))
+        results.append(missing_tool_result(root, "Prettier", "npx", js_files))
     return results
 
 
@@ -506,7 +589,7 @@ def add_make_checks(root: Path, selected: Sequence[str], run_tests: bool = True)
         return []
     make = which_in_project(root, ["make", "gmake"])
     if not make:
-        return [CheckResult("Makefile 质量目标", "SKIP", reason=f"发现 lint/check/test 目标，但{missing_tool_reason('make')}")]
+        return [missing_tool_result(root, "Makefile 质量目标", "make")]
     return [run_command(f"make {target}", [make, target], root) for target in supported_targets]
 
 
@@ -517,7 +600,7 @@ def add_precommit_check(root: Path, selected: Sequence[str], all_mode: bool) -> 
         return [], False
     precommit = which_in_project(root, ["pre-commit"])
     if not precommit:
-        return [CheckResult("pre-commit", "SKIP", reason=f"发现 .pre-commit-config.yaml，但{missing_tool_reason('pre-commit')}")], False
+        return [missing_tool_result(root, "pre-commit", "pre-commit")], False
     command = [precommit, "run", "--all-files"] if all_mode else [precommit, "run", "--files", *selected]
     return [run_command("pre-commit", command, root, selected)], True
 
@@ -536,7 +619,7 @@ def add_dotnet_checks(
         return []
     dotnet = which_in_project(root, ["dotnet"])
     if not dotnet:
-        return [CheckResult(".NET", "SKIP", reason=missing_tool_reason("dotnet"))]
+        return [missing_tool_result(root, ".NET", "dotnet")]
     if not project_files:
         return [CheckResult(".NET", "SKIP", reason="发现 C# 文件，但没有找到 .sln 或 .csproj")]
     target = str(project_files[0].relative_to(root))
@@ -552,7 +635,7 @@ def add_powershell_checks(root: Path, selected: Sequence[str]) -> list[CheckResu
         return []
     shell = which_in_project(root, ["pwsh", "powershell"])
     if not shell:
-        return [CheckResult("PSScriptAnalyzer", "SKIP", reason="未找到 PowerShell；请先安装 PowerShell")]
+        return [missing_tool_result(root, "PSScriptAnalyzer", "powershell")]
     module_check = subprocess.run(
         [shell, "-NoProfile", "-Command", "if (Get-Module -ListAvailable -Name PSScriptAnalyzer) { exit 0 } else { exit 3 }"],
         cwd=root,
@@ -564,12 +647,7 @@ def add_powershell_checks(root: Path, selected: Sequence[str]) -> list[CheckResu
     )
     if module_check.returncode != 0:
         return [
-            CheckResult(
-                "PSScriptAnalyzer",
-                "SKIP",
-                reason=missing_tool_reason("PSScriptAnalyzer"),
-                files=ps_files,
-            )
+            missing_tool_result(root, "PSScriptAnalyzer", "PSScriptAnalyzer", ps_files)
         ]
     paths = ",".join(ps_quote(str(root / path)) for path in ps_files)
     command = [
@@ -587,7 +665,7 @@ def add_shell_checks(root: Path, selected: Sequence[str]) -> list[CheckResult]:
         return []
     shellcheck = which_in_project(root, ["shellcheck"])
     if not shellcheck:
-        return [CheckResult("ShellCheck", "SKIP", reason=missing_tool_reason("shellcheck"), files=shell_files)]
+        return [missing_tool_result(root, "ShellCheck", "shellcheck", shell_files)]
     return [run_command("ShellCheck", [shellcheck, *shell_files], root, shell_files)]
 
 
@@ -606,15 +684,15 @@ def add_config_checks(root: Path, selected: Sequence[str]) -> list[CheckResult]:
         if yamllint:
             results.append(run_command("yamllint", [yamllint, *yaml_files], root, yaml_files))
         else:
-            results.append(CheckResult("YAML 语法检查", "SKIP", reason=missing_tool_reason("yamllint"), files=yaml_files))
+            results.append(missing_tool_result(root, "YAML 语法检查", "yamllint", yaml_files))
 
     markdown_files = [path for path in selected if Path(path).suffix.lower() == ".md"]
     if markdown_files:
         markdownlint = which_in_project(root, ["markdownlint-cli2", "markdownlint"])
         if markdownlint:
-            results.append(run_command("Markdown lint", [markdownlint, *markdown_files], root, markdown_files))
+            results.extend(run_batched_command("Markdown lint", [markdownlint], markdown_files, root))
         else:
-            results.append(CheckResult("Markdown lint", "SKIP", reason=missing_tool_reason("markdownlint"), files=markdown_files))
+            results.append(missing_tool_result(root, "Markdown lint", "markdownlint", markdown_files))
     return results
 
 
@@ -690,6 +768,7 @@ def markdown_report(
 ) -> str:
     statuses = ("PASS", "FAIL", "SKIP", "BASELINE", "INFO")
     counts = {status: sum(result.status == status for result in results) for status in statuses}
+    install_results = [result for result in results if result.install_command]
     lines = [
         "# Check Code v1 检查报告",
         "",
@@ -699,6 +778,7 @@ def markdown_report(
         f"- 项目类型：{', '.join(types) if types else '未识别'}",
         f"- 文件数量：`{len(selected)}`",
         f"- 统计：通过 `{counts['PASS']}`，失败 `{counts['FAIL']}`，跳过 `{counts['SKIP']}`，基线 `{counts['BASELINE']}`，信息 `{counts['INFO']}`",
+        f"- 待确认安装：`{len(install_results)}` 项",
         f"- 配置文件：`{config.path}`" if config.path else "- 配置文件：未使用",
         f"- 基线文件：`{baseline_path}`，抑制问题 `{suppressed_count}`" if baseline_path else "- 基线文件：未使用",
         f"- 新生成基线：`{baseline_write_path}`" if baseline_write_path else "- 新生成基线：未生成",
@@ -707,12 +787,19 @@ def markdown_report(
         "## 检查结果",
         "",
     ]
+    if install_results:
+        lines.extend(["## 待确认安装", "", "以下工具未安装。请先向用户确认，再执行安装并重新检查：", ""])
+        for result in install_results:
+            lines.append(f"- `{result.name}`：`{result.install_command}`")
+        lines.append("")
     if not results:
         lines.append("未发现可执行的检查项。请确认项目类型、改动范围或安装对应检查工具。")
     for result in results:
         lines.extend([f"### `{result.status}` {result.name}"])
         if result.reason:
             lines.append(f"- 说明：{result.reason}")
+        if result.install_command:
+            lines.append(f"- 待确认安装命令：`{result.install_command}`")
         if result.files:
             lines.append(f"- 文件：{', '.join(f'`{item}`' for item in result.files[:30])}")
         if result.command:
@@ -726,6 +813,7 @@ def markdown_report(
 def print_summary(scope: str, types: Sequence[str], results: Sequence[CheckResult], report: Path, exit_code: int) -> None:
     statuses = ("PASS", "FAIL", "SKIP", "BASELINE", "INFO")
     counts = {status: sum(result.status == status for result in results) for status in statuses}
+    install_results = [result for result in results if result.install_command]
     print("Check Code v1 检查完成")
     print(f"项目类型：{', '.join(types) if types else '未识别'}")
     print(f"检查范围：{scope}")
@@ -733,6 +821,10 @@ def print_summary(scope: str, types: Sequence[str], results: Sequence[CheckResul
     for result in results:
         detail = f" - {result.reason}" if result.reason else ""
         print(f"[{result.status}] {result.name}{detail}")
+    if install_results:
+        print(f"待确认安装：{len(install_results)} 项；请确认后执行安装并重新检查")
+        for result in install_results:
+            print(f"  {result.name}: {result.install_command}")
     print(f"报告文件：{report}")
     print(f"退出码：{exit_code}")
 
@@ -798,7 +890,7 @@ def main() -> int:
         results.extend(add_required_tool_checks(root, config))
         results.extend(add_configured_checks(root, selected, config))
         if not precommit_available:
-            results.extend(add_python_checks(root, selected, all_paths, config.run_tests))
+            results.extend(add_python_checks(root, selected, all_paths, config.run_tests, args.all))
             results.extend(add_node_checks(root, selected, config.run_tests))
             results.extend(add_make_checks(root, selected, config.run_tests))
             results.extend(add_dotnet_checks(root, selected, all_paths, config.run_tests))

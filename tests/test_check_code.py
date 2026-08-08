@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import check_code
 
@@ -103,6 +104,61 @@ required_tools = ["definitely-missing-tool"]
             result = self.run_checker(root, "--all")
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertIn("必需工具：definitely-missing-tool", result.stdout)
+
+    def test_missing_tool_has_explicit_install_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = check_code.missing_tool_result(root, "Ruff", "ruff", ["sample.py"])
+            self.assertEqual(result.status, "SKIP")
+            self.assertIn("pip install ruff", result.install_command)
+
+    def test_long_file_list_is_split_into_safe_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            files = [f"file_{index}_{'x' * 80}.py" for index in range(20)]
+            results = check_code.run_batched_command(
+                "batch test",
+                [sys.executable, "-c", "print('ok')"],
+                files,
+                root,
+                max_command_chars=300,
+            )
+            self.assertGreater(len(results), 1)
+            self.assertTrue(all(result.status == "PASS" for result in results))
+            self.assertTrue(all(len(result.command) <= 300 for result in results))
+
+    def test_full_python_check_uses_project_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            python_file = root / "sample.py"
+            python_file.write_text("print('ok')\n", encoding="utf-8")
+            captured: list[list[str]] = []
+
+            def fake_run(name, command, command_root, files=(), timeout=300):
+                captured.append(list(command))
+                return check_code.CheckResult(name=name, status="PASS", command=check_code.command_text(command))
+
+            with patch.object(check_code, "which_in_project", return_value="ruff.exe"):
+                with patch.object(check_code, "run_command", side_effect=fake_run):
+                    check_code.add_python_checks(root, ["sample.py"], [python_file], all_mode=True)
+
+            self.assertEqual(captured[0][1:3], ["check", "."])
+            self.assertEqual(captured[1][1:4], ["format", "--check", "."])
+
+    def test_cli_reports_pending_install_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "README.md").write_text("# fixture\n", encoding="utf-8")
+            (root / ".check-code.toml").write_text(
+                """[check-code]
+required_tools = ["definitely-missing-tool"]
+""",
+                encoding="utf-8",
+            )
+            result = self.run_checker(root, "--all")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("待确认安装", result.stdout)
+            self.assertIn("definitely-missing-tool", result.stdout)
 
     @staticmethod
     def run_checker(root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
