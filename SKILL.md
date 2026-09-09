@@ -1,6 +1,7 @@
 ---
 name: check-code-v1
-description: 通用代码质量检查技能。用于检查 Git 改动或整个项目中的 Python、JavaScript、TypeScript、C#、PowerShell、Shell 以及 JSON、YAML、TOML、Markdown 文件；自动识别项目结构，优先使用项目已有检查命令，调用可用的 lint、format、test 和语法检查工具，输出中文摘要、原始日志和 Markdown 报告。默认只检查不修改、不安装依赖；用户要求代码检查、提交前检查、PR 检查、质量检查或验证改动时使用。
+description: 通用代码质量检查技能。用于检查 Git 改动或整个项目中的 Python、JavaScript、TypeScript、C#、PowerShell、Shell 以及 JSON、YAML、TOML、Markdown 文件；自动识别项目结构，优先使用项目已有检查命令，调用可用的 lint、format、test 和语法检查工具，输出中文摘要、原始日志和 Markdown 报告。默认只检查不修改、不安装依赖；用户要求代码检查、提交前检查、PR
+...
 ---
 
 # Check Code v1
@@ -58,13 +59,13 @@ test = ["npm", "run", "test", "--if-present"]
 老项目可以先记录已有问题：
 
 ```powershell
-python "C:\Users\Fan-SJSS\.codex\skills\check-code-v1\scripts\check_code.py" --all --write-baseline baseline.json
+python "D:\AIwork\20260821-Fan-SkillHub\skills\shared\engineering\check-code-v1\scripts\check_code.py" --all --write-baseline baseline.json
 ```
 
 后续检查时只报告新增问题：
 
 ```powershell
-python "C:\Users\Fan-SJSS\.codex\skills\check-code-v1\scripts\check_code.py" --all --baseline baseline.json
+python "D:\AIwork\20260821-Fan-SkillHub\skills\shared\engineering\check-code-v1\scripts\check_code.py" --all --baseline baseline.json
 ```
 
 基线只抑制完全匹配的历史失败项，不会抑制新问题。基线文件应纳入 Git，更新基线前必须人工确认。
@@ -74,26 +75,26 @@ python "C:\Users\Fan-SJSS\.codex\skills\check-code-v1\scripts\check_code.py" --a
 在项目根目录执行：
 
 ```powershell
-python "C:\Users\Fan-SJSS\.codex\skills\check-code-v1\scripts\check_code.py"
+python "D:\AIwork\20260821-Fan-SkillHub\skills\shared\engineering\check-code-v1\scripts\check_code.py"
 ```
 
 常用参数：
 
 ```powershell
 # 检查整个项目
-python "C:\Users\Fan-SJSS\.codex\skills\check-code-v1\scripts\check_code.py" --all
+python "D:\AIwork\20260821-Fan-SkillHub\skills\shared\engineering\check-code-v1\scripts\check_code.py" --all
 
 # 缺少检查工具时也让命令失败，适合 CI 或 PR
-python "C:\Users\Fan-SJSS\.codex\skills\check-code-v1\scripts\check_code.py" --all --strict
+python "D:\AIwork\20260821-Fan-SkillHub\skills\shared\engineering\check-code-v1\scripts\check_code.py" --all --strict
 
 # 指定报告路径
-python "C:\Users\Fan-SJSS\.codex\skills\check-code-v1\scripts\check_code.py" --report work/check-code-v1/latest.md
+python "D:\AIwork\20260821-Fan-SkillHub\skills\shared\engineering\check-code-v1\scripts\check_code.py" --report work/check-code-v1/latest.md
 ```
 
 如果项目使用虚拟环境，优先使用项目解释器：
 
 ```powershell
-.\.venv\Scripts\python.exe "C:\Users\Fan-SJSS\.codex\skills\check-code-v1\scripts\check_code.py"
+.\.venv\Scripts\python.exe "D:\AIwork\20260821-Fan-SkillHub\skills\shared\engineering\check-code-v1\scripts\check_code.py"
 ```
 
 ## 结果处理

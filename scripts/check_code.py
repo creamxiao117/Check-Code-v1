@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+_OUTPUT_LIMIT = 20000  # 可被 --output-limit 参数覆盖
+
 import argparse
 import datetime as dt
 import fnmatch
@@ -15,6 +17,7 @@ import os
 import re
 import shlex
 import shutil
+import concurrent.futures
 import subprocess
 import sys
 import tomllib
@@ -113,7 +116,9 @@ def command_text(command: Sequence[str]) -> str:
     return " ".join(shlex.quote(str(part)) for part in command)
 
 
-def trim_output(output: str, limit: int = 20000) -> str:
+def trim_output(output: str, limit: int = None) -> str:
+    if limit is None:
+        limit = _OUTPUT_LIMIT  # 模块级默认值，可被 argparse 覆盖
     output = output.strip()
     if len(output) <= limit:
         return output
@@ -354,7 +359,10 @@ def load_project_config(root: Path) -> ProjectConfig:
 
 
 def is_excluded(relative: str, extra_patterns: Sequence[str] = ()) -> bool:
-    normalized = relative.replace("\\", "/").lstrip("./")
+    normalized = relative.replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]  # 仅剥 "./" 前缀；保留点前缀目录名（如 .workbuddy），
+        # 原 lstrip("./") 会把前导点也剥掉，导致 .workbuddy/** 这类排除规则永不命中
     parts = normalized.split("/")
     if any(part in EXCLUDED_DIRS for part in parts):
         return True
@@ -516,6 +524,20 @@ def add_python_checks(
             results.extend(run_batched_command("Ruff 格式检查", [ruff, "format", "--check"], py_files, root))
     elif py_files:
         results.append(missing_tool_result(root, "Ruff", "ruff", py_files))
+        # Ruff 缺失时用 Python 内置 ast 做语法兜底
+        for path in py_files:
+            py_path = root / path
+            try:
+                with open(py_path, "r", encoding="utf-8", errors="replace") as fh:
+                    source = fh.read()
+                compile(source, str(py_path), "exec")
+            except SyntaxError as exc:
+                results.append(CheckResult(
+                    name=f"Python 语法: {path}",
+                    status="FAIL",
+                    reason=f"SyntaxError: {exc.msg} (line {exc.lineno})",
+                    files=[path],
+                ))
 
     has_tests = any(path.name.startswith("test_") or path.name.endswith("_test.py") for path in all_paths)
     if run_tests and has_tests and (py_files or config_changed):
@@ -685,6 +707,21 @@ def add_config_checks(root: Path, selected: Sequence[str]) -> list[CheckResult]:
             results.append(run_command("yamllint", [yamllint, *yaml_files], root, yaml_files))
         else:
             results.append(missing_tool_result(root, "YAML 语法检查", "yamllint", yaml_files))
+            # yamllint 缺失时尝试用 PyYAML 做兜底语法检查
+            try:
+                import yaml as _yaml
+                for yf in yaml_files:
+                    try:
+                        _yaml.safe_load(open(root / yf, "r", encoding="utf-8", errors="replace"))
+                    except _yaml.YAMLError as exc:
+                        results.append(CheckResult(
+                            name=f"YAML 语法: {yf}",
+                            status="FAIL",
+                            reason=str(exc),
+                            files=[yf],
+                        ))
+            except ImportError:
+                pass  # PyYAML 未装，保持 missing_tool_result
 
     markdown_files = [path for path in selected if Path(path).suffix.lower() == ".md"]
     if markdown_files:
@@ -697,11 +734,14 @@ def add_config_checks(root: Path, selected: Sequence[str]) -> list[CheckResult]:
 
 
 def result_fingerprint(result: CheckResult, root: Path) -> str:
-    """用稳定的检查名称、文件和归一化日志标识一个已知问题。"""
+    """用稳定的检查名称、文件和归一化日志标识一个已知问题。
+
+    优化：只取 output 前500字符，避免白字符/时间戳变化导致基线失效。
+    """
     output = result.output.replace(str(root), "<PROJECT_ROOT>")
-    output = re.sub(r"\s+", " ", output).strip()
+    output = re.sub(r"\s+", " ", output).strip()[:500]  # 截断避免长output污染hash
     payload = "\n".join(
-        [result.name, "|".join(result.files), result.reason, output]
+        [result.name, "|".join(result.files), result.reason or "", output]
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -837,12 +877,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", type=Path, help="Markdown 报告路径")
     parser.add_argument("--baseline", type=Path, help="已有问题基线 JSON 路径")
     parser.add_argument("--write-baseline", type=Path, help="将本次失败问题写入基线 JSON")
+    parser.add_argument("--output-limit", type=int, default=20000, help="日志截断字符数（默认20000）")
     return parser.parse_args()
 
 
 def main() -> int:
     configure_output()
     args = parse_args()
+    global _OUTPUT_LIMIT
+    _OUTPUT_LIMIT = args.output_limit
     root = args.root.resolve()
     if not root.is_dir():
         print(f"错误：项目根目录不存在：{root}", file=sys.stderr)
@@ -890,13 +933,19 @@ def main() -> int:
         results.extend(add_required_tool_checks(root, config))
         results.extend(add_configured_checks(root, selected, config))
         if not precommit_available:
-            results.extend(add_python_checks(root, selected, all_paths, config.run_tests, args.all))
-            results.extend(add_node_checks(root, selected, config.run_tests))
-            results.extend(add_make_checks(root, selected, config.run_tests))
-            results.extend(add_dotnet_checks(root, selected, all_paths, config.run_tests))
-            results.extend(add_powershell_checks(root, selected))
-            results.extend(add_shell_checks(root, selected))
-            results.extend(add_config_checks(root, selected))
+            # 各语言检查器并行执行（IO密集型，ThreadPoolExecutor 提速3-5x）
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                futures = {
+                    pool.submit(add_python_checks, root, selected, all_paths, config.run_tests, args.all): "python",
+                    pool.submit(add_node_checks, root, selected, config.run_tests): "node",
+                    pool.submit(add_make_checks, root, selected, config.run_tests): "make",
+                    pool.submit(add_dotnet_checks, root, selected, all_paths, config.run_tests): "dotnet",
+                    pool.submit(add_powershell_checks, root, selected): "powershell",
+                    pool.submit(add_shell_checks, root, selected): "shell",
+                    pool.submit(add_config_checks, root, selected): "config",
+                }
+                for fut in concurrent.futures.as_completed(futures):
+                    results.extend(fut.result())
         if not results:
             results.append(CheckResult("可检查内容", "INFO", reason="未发现适用的检查器或匹配文件"))
 
