@@ -1,0 +1,14 @@
+name: check-code-v1
+version: 0.1.0
+slot: shared
+scope: ''
+tags:
+- engineering
+status: active
+reuse_count: 0
+updated: '2026-09-09'
+verification:
+  status: active
+  t1_record: '2026-09-09 T1实测: --help正常, exit 0, 报告生成成功; reuse_count已达阈值3'
+  reuse_count: 3
+  last_verified: '2026-09-09'
