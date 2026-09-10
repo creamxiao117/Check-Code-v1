@@ -105,7 +105,7 @@ python "D:\AIwork\20260821-Fan-SkillHub\skills\shared\engineering\check-code-v1\
 .\.venv\Scripts\python.exe "D:\AIwork\20260821-Fan-SkillHub\skills\shared\engineering\check-code-v1\scripts\check_code.py"
 ```
 
-Windows 无 .venv 时的解释器优先级（2026-09-10 实战新增）：WorkBuddy 托管 Python（`C:\Users\<user>\.workbuddy\binaries\python\versions\<ver>\python.exe`）→ 系统 Python。**注意：PATH 上抓到的解释器/venv 未必装了项目依赖**（如共享 venv 是别的工具专用，pytest 收集即错、退出码 2），先验证再跑：`python -c "import <项目关键依赖>"`，失败则改用 `.check-code.toml` 的 `[check-code.commands]` 把 test/lint 固定到正确解释器。项目 `core.hooksPath` 指向自定义 pre-commit（git config 而非 .pre-commit-config.yaml）时同样算"项目已有 Hook"，跳过内置重复检查。
+Windows 无 .venv 时的解释器优先级（2026-09-10 实战新增）：项目 `root/.venv` → `root/venv` → PATH。**注意两点**：① PATH 上抓到的解释器/venv 未必装了项目依赖（如共享 venv 是别的工具专用，pytest 收集即错、退出码 2）——先验证 `python -c "import <项目关键依赖>"`，失败就给项目建标准 `.venv` 并 `pip install -e ".[dev]"`（which_in_project 会优先命中，一劳永逸）；② `[check-code.commands]` 是**附加**检查项，不覆盖内置 pytest/ruff，无法用来改解释器。项目 `core.hooksPath` 指向自定义 pre-commit（git config 而非 .pre-commit-config.yaml）时同样算"项目已有 Hook"，跳过内置重复检查。运行态目录（`.workbuddy/`、日志、归档）应加进 `exclude`，不进 markdownlint/JSON 检查。
 
 ## 结果处理
 
