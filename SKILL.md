@@ -31,6 +31,14 @@ description: 通用代码质量检查技能。用于检查 Git 改动或整个�
 4. 用户确认后，执行报告中列出的命令；安装完成后自动重新运行原检查命令。
 5. 重新检查仍有失败或缺失时，继续报告实际状态，不能把安装动作当成检查通过。
 
+## Qt / GUI 项目的测试防污染（2026-09-10 实战新增）
+
+项目依赖含 PySide6 / PyQt5/6 时，直接跑 pytest 会在**用户真实桌面弹出空白窗口和通知**（测试污染，用户会当显示 bug 投诉）。执行规则：
+
+1. 跑 pytest 前先查依赖：`grep -iE "pyside6|pyqt" pyproject.toml requirements*.txt`。
+2. 命中则确保 `QT_QPA_PLATFORM=offscreen`（优先看项目 conftest.py 是否已设；没设就 export 后再跑，**不要改项目源文件**）。
+3. 报告中注明测试是否运行于 offscreen，便于追溯"桌面弹窗"类投诉。
+
 ## 项目配置
 
 项目根目录可以增加 `.check-code.toml`，控制本项目的检查行为：
@@ -97,12 +105,40 @@ python "D:\AIwork\20260821-Fan-SkillHub\skills\shared\engineering\check-code-v1\
 .\.venv\Scripts\python.exe "D:\AIwork\20260821-Fan-SkillHub\skills\shared\engineering\check-code-v1\scripts\check_code.py"
 ```
 
+Windows 无 .venv 时的解释器优先级（2026-09-10 实战新增）：WorkBuddy 托管 Python（`C:\Users\<user>\.workbuddy\binaries\python\versions\<ver>\python.exe`）→ 系统 Python。项目 `core.hooksPath` 指向自定义 pre-commit（git config 而非 .pre-commit-config.yaml）时同样算"项目已有 Hook"，跳过内置重复检查。
+
 ## 结果处理
 
 - 退出码 `0`：适用的检查通过；可以存在非严格模式下的工具缺失或跳过。
 - 退出码 `1`：至少一个适用检查失败。
 - 退出码 `2`：技能运行错误、项目根目录无效或报告无法生成。
 - 需要修复时，先引用报告中的文件、行号和原始输出，再单独执行修复；不要在本技能检查阶段隐式修改文件。
+
+## 失败修复的常见诱因（直接定位）
+
+修复 check-code-v1 失败时，先按这些高频模式匹配，不要从 0 排查：
+
+| 失败现象 | 高频根因 | 定位命令 |
+|:--|:--|:--|
+| Ruff F401 `imported but unused` | 引入新 import 但实际未用 | `grep "from xxx import" <file> \| wc -l` vs 使用次数 |
+| **Ruff 错误"凭空爆几十上百个"** | pyproject 无 `[tool.ruff.lint] select` → 规则集随 ruff 版本漂移（新版默认集扩张） | `ruff check --isolated <file>` 对照：isolated 也报 = 规则漂移非代码问题；根治 = 锁 `select = ["E","W","F","I","B"]`，勿批量"修"漂移项 |
+| Ruff I001 import 排序错 | 新 import 加在文件末尾 | `ruff check --fix` 自动修 |
+| Ruff DTZ011 `datetime.date.today()` | 用 local date 而非 UTC | 改 `datetime.now(tz=timezone.utc).date()` |
+| Ruff F821 undefined name | 局部 import 在函数内但函数外用 | 移到文件顶部 |
+| Ruff RUF100 unused noqa | `# noqa: E501` 之类但 E501 未启用 | 删 noqa |
+| Ruff ISC004 implicit str concat | `["foo", "bar"]` 多个相邻 str 无 `,` | 改用 `+` 或 `\n.join()` |
+| Markdown MD022 标题前后空行 | 三级标题后缺空行 | 标题后加一行 |
+| Ruff 格式错 | 缩进/行长/空行 | `ruff format <file>` 自动修 |
+| yamllint CRLF | Windows 写 YAML 用了 CRLF | `sed -i 's/
+$//' <file>` + 加 `---` 首行 |
+
+**修完后再跑** `--all`：必须回到 14/14 PASS / 退出码 0 才算完成。
+
+## 多仓并行写时的"只提交自己"纪律
+
+- 跑 `--all` 时**只 fix 自己 commit 的文件**；别人的 M 状态（含 untracked + 别人改的）不动。
+- `git status` 输出中：`M `（大写空格）= staged by me；` M`（空格大写）= unstaged by someone else；`??` = untracked。
+- 报"最后退出码 1"但报告里只看到别人的文件错 → **不修**，是别的 Agent 在制品；只报状态让用户决定。
 
 ## 报告要求
 
